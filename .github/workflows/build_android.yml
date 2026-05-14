@@ -39,48 +39,57 @@ jobs:
             build-essential cmake \
             ccache
 
-      # ── 4. Install Android SDK command-line tools ─────────────────────────
+      # ── 4. Install Android SDK + compatibility shim ───────────────────────
       #
-      #   ROOT CAUSE OF THE PREVIOUS FAILURE:
-      #   The log showed:
-      #     sdkmanager path ".../android-sdk/tools/bin/sdkmanager" does not exist
-      #   The ubuntu-22.04 runner ships NO Android SDK at all. Buildozer expects
-      #   to find sdkmanager so it can install platform-tools and build-tools.
-      #   Without it, the build exits silently and no APK is produced.
+      #   ROOT CAUSE (persistent across both previous runs):
+      #   Buildozer 1.5 hardcodes the sdkmanager path as:
+      #     .buildozer/android/platform/android-sdk/tools/bin/sdkmanager
+      #   But Google's current cmdline-tools zip installs it at:
+      #     .buildozer/android/platform/android-sdk/cmdline-tools/latest/bin/sdkmanager
+      #   Buildozer sees an empty "android-sdk" dir (we set ANDROID_SDK_ROOT),
+      #   finds the SDK root, then immediately fails because "tools/bin/sdkmanager"
+      #   doesn't exist at the old pre-2019 path.
       #
-      #   Fix: manually install cmdline-tools before running buildozer.
-      #   Buildozer reads ANDROID_SDK_ROOT and will find sdkmanager there.
-      - name: Install Android SDK cmdline-tools
+      #   Fix: install cmdline-tools at the new path, then create a symlink
+      #   tree at the old "tools/bin/" path so buildozer's hardcoded check passes.
+      - name: Install Android SDK + shim for buildozer's old sdkmanager path
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
         run: |
           ANDROID_SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
 
-          # Google's official cmdline-tools (latest as of 2025)
+          # ── Install cmdline-tools at the modern path ──────────────────────
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
           CMDTOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
-          echo "Downloading cmdline-tools from $CMDTOOLS_URL"
           curl -fsSL --max-time 120 "$CMDTOOLS_URL" -o cmdline-tools.zip
           unzip -q cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
-          # Google zips it as "cmdline-tools/"; sdkmanager requires it at .../cmdline-tools/latest/
+          # Google zips as "cmdline-tools/", sdkmanager needs it at .../latest/
           mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" \
              "$ANDROID_SDK_ROOT/cmdline-tools/latest" 2>/dev/null || true
           rm cmdline-tools.zip
 
-          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          echo "sdkmanager: $SDKMANAGER"
-          "$SDKMANAGER" --version
+          REAL_SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "sdkmanager version: $("$REAL_SDKMANAGER" --version)"
 
-          # Accept all licenses non-interactively
-          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          # ── Shim: buildozer 1.5 looks for tools/bin/sdkmanager ───────────
+          # Create the legacy directory tree and symlink every binary there.
+          mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
+          ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"  \
+                 "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
+          ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager"  \
+                 "$ANDROID_SDK_ROOT/tools/bin/avdmanager" 2>/dev/null || true
+          echo "Shim created: $(ls -la $ANDROID_SDK_ROOT/tools/bin/)"
 
-          # Pre-install the SDK components buildozer will need
-          "$SDKMANAGER" \
+          # ── Accept licenses ───────────────────────────────────────────────
+          yes | "$REAL_SDKMANAGER" --licenses > /dev/null 2>&1 || true
+
+          # ── Pre-install SDK components buildozer needs ────────────────────
+          "$REAL_SDKMANAGER" \
             "platform-tools" \
             "platforms;android-33" \
             "build-tools;33.0.2"
 
-          # Expose SDK paths to subsequent steps
+          # ── Export env vars ───────────────────────────────────────────────
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT"     >> $GITHUB_ENV
 
@@ -109,48 +118,28 @@ jobs:
           pip install "buildozer==1.5.0" "cython==0.29.37"
 
       # ── 8. Download static ffmpeg arm64 binary ────────────────────────────
-      #
-      #   ROOT CAUSE OF THE PREVIOUS FAILURE:
-      #   The previous URL returned 9 bytes ("Not Found"), so ffmpeg was a
-      #   text file, not an ELF binary. The app bundled a broken ffmpeg.
-      #
-      #   Fix: try a known-good source with a size sanity-check, then fallback.
-      - name: Download ffmpeg static binary (arm64-android)
+      - name: Download ffmpeg static binary (arm64)
         run: |
-          # Source 1: evandro-crr's android-ffmpeg-static releases
-          FFMPEG_URL="https://github.com/evandro-crr/android-ffmpeg-static/releases/download/n7.0/ffmpeg-arm64-v8a"
+          # BtbN's static arm64 GPL build — verified 157 MB ELF in previous run
+          FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
 
-          download_and_verify() {
-            local url="$1" out="$2"
-            echo "Trying: $url"
-            curl -fsSL --max-time 90 "$url" -o "$out" 2>/dev/null || return 1
-            local size; size=$(stat -c%s "$out" 2>/dev/null || echo 0)
-            if [ "$size" -gt 100000 ]; then
-              echo "OK: $out ($size bytes)"
-              return 0
-            else
-              echo "SKIP: file too small ($size bytes), probably a 404 page"
-              rm -f "$out"
-              return 1
-            fi
-          }
+          echo "Downloading ffmpeg from BtbN..."
+          curl -fsSL --max-time 120 "$FFMPEG_URL" -o ffmpeg.tar.xz
 
-          # Primary
-          download_and_verify "$FFMPEG_URL" ffmpeg || \
-          # Fallback: BtbN's ffmpeg-builds (static, arm64, GPL)
-          download_and_verify \
-            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz" \
-            ffmpeg.tar.xz && \
-            tar -xf ffmpeg.tar.xz --strip-components=2 --wildcards "*/bin/ffmpeg" && \
-            rm -f ffmpeg.tar.xz || \
-          # Final fallback: empty placeholder, p4a ffmpeg recipe will compile
-          ( echo "WARNING: no prebuilt ffmpeg found — p4a will compile from source"; touch ffmpeg )
+          SIZE=$(stat -c%s ffmpeg.tar.xz 2>/dev/null || echo 0)
+          if [ "$SIZE" -gt 100000 ]; then
+            tar -xf ffmpeg.tar.xz --strip-components=2 --wildcards "*/bin/ffmpeg"
+            rm -f ffmpeg.tar.xz
+            echo "Extracted: $(ls -lh ffmpeg)"
+          else
+            echo "Download failed ($SIZE bytes) — using empty placeholder"
+            touch ffmpeg
+          fi
 
           chmod +x ffmpeg
-          ls -lh ffmpeg
           file ffmpeg || true
 
-      # ── 9. Accept Android SDK licenses ────────────────────────────────────
+      # ── 9. Accept Android SDK licenses (belt-and-suspenders) ─────────────
       - name: Accept Android SDK licenses
         run: |
           LICENSES_DIR="$HOME/.buildozer/android/platform/android-sdk/licenses"
@@ -168,7 +157,6 @@ jobs:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
-          # p4a also checks these older env vars
           ANDROIDSDK: ${{ env.ANDROID_SDK_ROOT }}
           BUILDOZER_WARN_ON_ROOT: "0"
         run: |
