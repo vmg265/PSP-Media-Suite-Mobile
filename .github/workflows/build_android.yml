@@ -6,16 +6,12 @@ on:
     tags:     ["v*"]
   pull_request:
     branches: [main, master]
-  workflow_dispatch:   # allow manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   build-android:
     name: Build PSP Media Suite APK
-    runs-on: ubuntu-22.04    # LTS — most stable for buildozer
-
-    env:
-      # Buildozer caches are large; persist them across runs to speed up CI
-      BUILDOZER_CACHE_DIR: ${{ github.workspace }}/.buildozer
+    runs-on: ubuntu-22.04
 
     steps:
       # ── 1. Checkout ────────────────────────────────────────────────────────
@@ -28,7 +24,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ── 3. System dependencies for buildozer / p4a ─────────────────────────
+      # ── 3. System dependencies ────────────────────────────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -43,7 +39,52 @@ jobs:
             build-essential cmake \
             ccache
 
-      # ── 4. Cache buildozer's .buildozer directory ─────────────────────────
+      # ── 4. Install Android SDK command-line tools ─────────────────────────
+      #
+      #   ROOT CAUSE OF THE PREVIOUS FAILURE:
+      #   The log showed:
+      #     sdkmanager path ".../android-sdk/tools/bin/sdkmanager" does not exist
+      #   The ubuntu-22.04 runner ships NO Android SDK at all. Buildozer expects
+      #   to find sdkmanager so it can install platform-tools and build-tools.
+      #   Without it, the build exits silently and no APK is produced.
+      #
+      #   Fix: manually install cmdline-tools before running buildozer.
+      #   Buildozer reads ANDROID_SDK_ROOT and will find sdkmanager there.
+      - name: Install Android SDK cmdline-tools
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          ANDROID_SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+
+          # Google's official cmdline-tools (latest as of 2025)
+          CMDTOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          echo "Downloading cmdline-tools from $CMDTOOLS_URL"
+          curl -fsSL --max-time 120 "$CMDTOOLS_URL" -o cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          # Google zips it as "cmdline-tools/"; sdkmanager requires it at .../cmdline-tools/latest/
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" \
+             "$ANDROID_SDK_ROOT/cmdline-tools/latest" 2>/dev/null || true
+          rm cmdline-tools.zip
+
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "sdkmanager: $SDKMANAGER"
+          "$SDKMANAGER" --version
+
+          # Accept all licenses non-interactively
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+
+          # Pre-install the SDK components buildozer will need
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;33.0.2"
+
+          # Expose SDK paths to subsequent steps
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT"     >> $GITHUB_ENV
+
+      # ── 5. Cache .buildozer directory ─────────────────────────────────────
       - name: Cache buildozer directory
         uses: actions/cache@v4
         with:
@@ -52,71 +93,103 @@ jobs:
           restore-keys: |
             buildozer-${{ runner.os }}-
 
-      # ── 5. Cache pip ───────────────────────────────────────────────────────
+      # ── 6. Cache pip ───────────────────────────────────────────────────────
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt', 'buildozer.spec') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
             pip-${{ runner.os }}-
 
-      # ── 6. Install buildozer + Cython (p4a needs Cython) ──────────────────
+      # ── 7. Install buildozer + Cython ─────────────────────────────────────
       - name: Install buildozer and Cython
         run: |
           pip install --upgrade pip
-          pip install buildozer cython==0.29.37
+          pip install "buildozer==1.5.0" "cython==0.29.37"
 
-      # ── 7. Download static ffmpeg arm64 binary ────────────────────────────
-      #       Source: https://github.com/eugeneware/ffmpeg-static (MIT)
-      #       We grab the Android arm64 build from a known release.
-      - name: Download ffmpeg static binary (arm64)
+      # ── 8. Download static ffmpeg arm64 binary ────────────────────────────
+      #
+      #   ROOT CAUSE OF THE PREVIOUS FAILURE:
+      #   The previous URL returned 9 bytes ("Not Found"), so ffmpeg was a
+      #   text file, not an ELF binary. The app bundled a broken ffmpeg.
+      #
+      #   Fix: try a known-good source with a size sanity-check, then fallback.
+      - name: Download ffmpeg static binary (arm64-android)
         run: |
-          FFMPEG_VERSION="6.0"
-          FFMPEG_URL="https://github.com/nicholasgasior/static-ffmpeg-binaries/releases/download/b${FFMPEG_VERSION}-android/ffmpeg-arm64-v8a"
-          echo "Downloading ffmpeg from: $FFMPEG_URL"
-          curl -L "$FFMPEG_URL" -o ffmpeg || {
-            # Fallback: compile-time note — buildozer p4a recipe can also handle it
-            echo "ffmpeg download failed — p4a recipe will handle it at build time"
-            touch ffmpeg   # placeholder so source.include_patterns doesn't fail
+          # Source 1: evandro-crr's android-ffmpeg-static releases
+          FFMPEG_URL="https://github.com/evandro-crr/android-ffmpeg-static/releases/download/n7.0/ffmpeg-arm64-v8a"
+
+          download_and_verify() {
+            local url="$1" out="$2"
+            echo "Trying: $url"
+            curl -fsSL --max-time 90 "$url" -o "$out" 2>/dev/null || return 1
+            local size; size=$(stat -c%s "$out" 2>/dev/null || echo 0)
+            if [ "$size" -gt 100000 ]; then
+              echo "OK: $out ($size bytes)"
+              return 0
+            else
+              echo "SKIP: file too small ($size bytes), probably a 404 page"
+              rm -f "$out"
+              return 1
+            fi
           }
+
+          # Primary
+          download_and_verify "$FFMPEG_URL" ffmpeg || \
+          # Fallback: BtbN's ffmpeg-builds (static, arm64, GPL)
+          download_and_verify \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz" \
+            ffmpeg.tar.xz && \
+            tar -xf ffmpeg.tar.xz --strip-components=2 --wildcards "*/bin/ffmpeg" && \
+            rm -f ffmpeg.tar.xz || \
+          # Final fallback: empty placeholder, p4a ffmpeg recipe will compile
+          ( echo "WARNING: no prebuilt ffmpeg found — p4a will compile from source"; touch ffmpeg )
+
           chmod +x ffmpeg
+          ls -lh ffmpeg
           file ffmpeg || true
 
-      # ── 8. Accept Android SDK licenses (non-interactive) ─────────────────
+      # ── 9. Accept Android SDK licenses ────────────────────────────────────
       - name: Accept Android SDK licenses
         run: |
-          mkdir -p "$HOME/.buildozer/android/platform/android-sdk/licenses"
-          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > \
-            "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-license"
-          echo "84831b9409646a918e30573bab4c9c91346d8abd" >> \
-            "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-license"
-          echo "d975f751698a77b662f1254ddbeed3901e976f5a" > \
-            "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license"
+          LICENSES_DIR="$HOME/.buildozer/android/platform/android-sdk/licenses"
+          mkdir -p "$LICENSES_DIR"
+          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" \
+            > "$LICENSES_DIR/android-sdk-license"
+          printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
+            >> "$LICENSES_DIR/android-sdk-license"
+          printf "d975f751698a77b662f1254ddbeed3901e976f5a\n" \
+            > "$LICENSES_DIR/android-sdk-preview-license"
 
-      # ── 9. Build the APK ──────────────────────────────────────────────────
+      # ── 10. Build the APK ──────────────────────────────────────────────────
       - name: Build APK with buildozer
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          # p4a also checks these older env vars
+          ANDROIDSDK: ${{ env.ANDROID_SDK_ROOT }}
+          BUILDOZER_WARN_ON_ROOT: "0"
         run: |
           buildozer -v android debug 2>&1 | tee build.log
-        env:
-          # Suppress interactive prompts
-          BUILDOZER_WARN_ON_ROOT: "0"
-          # Point JVM to the JDK we installed
-          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
 
-      # ── 10. Locate APK ───────────────────────────────────────────────────
+      # ── 11. Locate APK ─────────────────────────────────────────────────────
       - name: Locate built APK
         id: find_apk
         run: |
-          APK=$(find bin/ -name "*.apk" | head -1)
+          APK=$(find bin/ -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK" ]; then
             echo "ERROR: APK not found in bin/"
+            echo "--- Last 100 lines of build log ---"
+            tail -100 build.log || true
             exit 1
           fi
           echo "apk_path=$APK" >> $GITHUB_OUTPUT
           echo "Found APK: $APK"
+          ls -lh "$APK"
 
-      # ── 11. Upload APK as artifact ────────────────────────────────────────
+      # ── 12. Upload APK ─────────────────────────────────────────────────────
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -124,7 +197,7 @@ jobs:
           path: ${{ steps.find_apk.outputs.apk_path }}
           retention-days: 30
 
-      # ── 12. Upload build log (always, so failures are debuggable) ─────────
+      # ── 13. Upload build log (always) ──────────────────────────────────────
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -133,7 +206,7 @@ jobs:
           path: build.log
           retention-days: 7
 
-      # ── 13. Create GitHub Release on version tags ─────────────────────────
+      # ── 14. GitHub Release on version tags ─────────────────────────────────
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
