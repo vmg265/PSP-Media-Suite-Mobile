@@ -15,7 +15,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # Locks in a stable Python version
+          python-version: '3.11' 
 
       - name: Install System Dependencies
         run: |
@@ -28,12 +28,10 @@ jobs:
           pip install buildozer cython virtualenv
 
       - name: Build with Buildozer
-        # This command actually packages the APK based on your buildozer.spec file
         run: buildozer android debug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: PSP-Media-Suite-APK
-          # Buildozer automatically drops finished APKs in the bin/ folder
           path: bin/*.apk
